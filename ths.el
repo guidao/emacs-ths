@@ -34,6 +34,15 @@
 (defcustom ths-auto-fetch t
   "Whether opening THS starts network requests."
   :type 'boolean :group 'ths)
+(defcustom ths-default-section 'detail
+  "Default quote section in narrow windows.
+Used when opening THS or returning to quotes with `ths-show-quotes'.
+Opening a security explicitly still shows its details.  Wide windows
+keep their multi-panel layout.  After changing this option, press 0
+in THS to return to the configured default section."
+  :type '(choice (const :tag "行情列表" list) (const :tag "个股详情" detail)
+                 (const :tag "五档盘口" book) (const :tag "成交记录" trades))
+  :group 'ths)
 
 (defun ths--set-watchlist-columns (symbol columns)
   "Validate and set SYMBOL to watchlist COLUMNS, then repaint open dashboards."
@@ -445,7 +454,7 @@ FORCE allows an explicit category click to move focus from its button."
      (let ((next (copy-sequence old)))
        (setq next (plist-put next :page (if favorites 'watchlist 'quotes))
              next (plist-put next :tab (if favorites 'favorites 'all))
-             next (plist-put next :section (if favorites 'list 'detail)))
+             next (plist-put next :section (when favorites 'list)))
        (when favorites
          (setq next (plist-put next :query "")))
        (let ((stocks (ths--stocks next)))
@@ -1254,7 +1263,7 @@ NAME is optional display metadata selected from stock search suggestions."
          (ths--panel-rows (max 1 (- height 3 gap)))
          (ths--roomy (and (not (eq (plist-get state :page) 'ranking)) (>= ths--panel-rows 30)))
          (wide (>= columns 136))
-         (section (or (plist-get state :section) 'detail)))
+         (section (or (plist-get state :section) (if wide 'detail ths-default-section))))
     (setq ths--stock-page-size
           (max 1 (/ (- ths--panel-rows (ths--panel-overhead) 3) (if ths--roomy 3 1))))
     (cond
