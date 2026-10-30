@@ -22,6 +22,7 @@
   "Name of the market dashboard buffer." :type 'string :group 'ths)
 (defvar-local ths--state nil "ETAF state ref belonging to this buffer.")
 (defvar ths-mode-map)
+(declare-function meow-motion-mode "meow-core" (&optional arg))
 (defvar-local ths--ranking-pending-focus nil
   "Ranking key and first/last edge awaiting keyboard focus after a page load.")
 (defvar-local ths--ranking-toolbar-stock nil
@@ -33,6 +34,53 @@
 (defcustom ths-auto-fetch t
   "Whether opening THS starts network requests."
   :type 'boolean :group 'ths)
+
+(defun ths--set-watchlist-columns (symbol columns)
+  "Validate and set SYMBOL to watchlist COLUMNS, then repaint open dashboards."
+  (unless (and (consp columns) (proper-list-p columns)
+               (cl-every (lambda (column)
+                           (and (proper-list-p column) (= (length column) 3)
+                                (memq (car column) '(:code :name :price :change :volume :float-cap
+                                                    :amount :turnover :open :high :low :close :time))
+                                (stringp (nth 1 column)) (not (string-empty-p (nth 1 column)))
+                                (integerp (nth 2 column)) (>= (nth 2 column) 2))) columns))
+    (user-error "表头须为非空的 (字段 标题 宽度) 列表，宽度至少为 2"))
+  (set-default symbol columns)
+  (when (fboundp 'ths--publish)
+    (dolist (buffer (buffer-list))
+      (with-current-buffer buffer
+        (when (and ths--state (etaf-runtime-for-buffer buffer)) (ths--publish))))))
+
+(defcustom ths-watchlist-columns
+  '((:code "代码" 8) (:name "名称" 10) (:price "最新" 9) (:change "涨跌幅" 9)
+    (:volume "成交量" 12) (:float-cap "流通市值" 13) (:amount "成交额" 12) (:turnover "换手率" 9))
+  "Watchlist columns in display order, each (FIELD TITLE WIDTH).
+WIDTH is in character cells, including a one-cell trailing gap.
+Columns that do not fit are hidden from the right; put important columns first.
+Customize this option to apply immediately, or use `ths-refit' after `setq'."
+  :type '(repeat (list (choice (const :code) (const :name) (const :price) (const :change)
+                               (const :volume) (const :float-cap) (const :amount) (const :turnover)
+                               (const :open) (const :high) (const :low) (const :close) (const :time))
+                       (string :tag "标题") (integer :tag "宽度")))
+  :set #'ths--set-watchlist-columns :group 'ths)
+
+(defun ths-configure-watchlist-columns ()
+  "Customize the watchlist's column order, titles and widths."
+  (interactive)
+  (customize-variable 'ths-watchlist-columns))
+
+(defun ths--watchlist-columns (columns)
+  "Return the configured column prefix fitting COLUMNS character cells."
+  (let ((remaining (max 2 (- columns 4))) fields)
+    (catch 'full
+      (dolist (field ths-watchlist-columns)
+        (when (> (nth 2 field) remaining)
+          (unless fields
+            (push (list (car field) (nth 1 field) remaining) fields))
+          (throw 'full nil))
+        (push field fields)
+        (setq remaining (- remaining (nth 2 field)))))
+    (nreverse fields)))
 (defvar-local ths--timer nil)
 (defvar-local ths--requests nil)
 (defvar-local ths--session nil)
@@ -138,7 +186,7 @@
 (defun ths--ensure-chart (&optional force)
   "Fetch the selected chart and trades if expired, or when FORCE is non-nil."
   (when (and ths-auto-fetch ths--session
-             (not (eq (plist-get (etaf-value ths--state) :page) 'ranking)))
+             (eq (plist-get (etaf-value ths--state) :page) 'quotes))
     (let* ((state (etaf-value ths--state))
            (stock (ths-data-find (plist-get state :selected))))
       (when stock
@@ -386,13 +434,78 @@ FORCE allows an explicit category click to move focus from its button."
   (interactive)
   (ths-ranking-set-universe (plist-get (etaf-value ths--state) :ranking-universe)))
 
-(defun ths-show-quotes ()
-  "Return to the quote dashboard."
+(defun ths-show-quotes (&optional favorites)
+  "Show all quotes, or the watchlist when FAVORITES is non-nil."
   (interactive)
   (ths--ranking-save-position)
   (setq ths--ranking-pending-focus nil)
-  (ths--set ths--state :page 'quotes)
+  (etaf-update-value
+   ths--state
+   (lambda (old)
+     (let ((next (copy-sequence old)))
+       (setq next (plist-put next :page (if favorites 'watchlist 'quotes))
+             next (plist-put next :tab (if favorites 'favorites 'all))
+             next (plist-put next :section (if favorites 'list 'detail)))
+       (when favorites
+         (setq next (plist-put next :query "")))
+       (let ((stocks (ths--stocks next)))
+         (unless (seq-find (lambda (stock)
+                            (equal (ths-data-id stock) (plist-get next :selected))) stocks)
+           (setq next (plist-put next :selected (ths-data-id (car stocks))))))
+       next)))
+  (ths--ensure-chart)
+  (when favorites (ths--watchlist-focus))
   (when ths-auto-fetch (ths-refresh)))
+
+(defun ths-show-watchlist ()
+  "Show the plugin's saved watchlist."
+  (interactive)
+  (ths-show-quotes t))
+
+(defun ths--watchlist-focus ()
+  "Focus the selected watchlist row after the current render."
+  (let ((buffer (current-buffer)) (session ths--session))
+    (etaf-next-tick
+     (lambda ()
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (let* ((state (etaf-value ths--state))
+                  (runtime (etaf-runtime-for-buffer buffer))
+                  (code (plist-get state :selected))
+                  (target (and code (intern (concat "watch-" code)))))
+             (when (and runtime (eq session ths--session)
+                        (eq (plist-get state :page) 'watchlist)
+                        target (etaf-host-ref-position runtime target))
+               (etaf-focus runtime target)
+               (ths--pin-window-top buffer)))))))))
+
+(defun ths--watchlist-open (ref stock)
+  "Open watchlist STOCK's intraday details using REF."
+  (etaf-update-value
+   ref (lambda (old)
+         (let ((next (copy-sequence old)))
+           (dolist (pair `((:page . quotes) (:tab . all) (:query . "")
+                          (:selected . ,(ths-data-id stock)) (:section . detail)
+                          (:chart . intraday)))
+             (setq next (plist-put next (car pair) (cdr pair))))
+           next)))
+  (when ths-auto-fetch
+    (ths--fetch (plist-get stock :symbol) 'quote)
+    (ths--ensure-chart)))
+
+(defun ths--watchlist-select-focused (ref code)
+  "Select focused CODE in REF after row reconciliation finishes."
+  (let ((buffer (current-buffer)) (session ths--session))
+    (etaf-next-tick
+     (lambda ()
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (let ((runtime (etaf-runtime-for-buffer buffer)) (state (etaf-value ref)))
+             (when (and runtime (eq session ths--session)
+                        (eq (plist-get state :page) 'watchlist)
+                        (eq (etaf-focused-host-ref runtime) (intern (concat "watch-" code)))
+                        (not (equal code (plist-get state :selected))))
+               (ths--set ref :selected code)))))))))
 
 (defun ths-ranking-next-page (&optional backwards)
   "Go to the next ranking page, or previous when BACKWARDS is non-nil."
@@ -504,7 +617,7 @@ FORCE allows an explicit category click to move focus from its button."
             (text (if (not stock) (nth 1 field)
                     (pcase key
                       (:rank (number-to-string value))
-                      (:price (ths-data-format-price stock value))
+                      ((or :price :open :high :low :close) (ths-data-format-price stock value))
                       ((or :change :change-60d) (ths--number value "%+.2f%%"))
                       (:volume (ths--volume value))
                       ((or :amount :float-cap) (ths--amount value))
@@ -534,6 +647,7 @@ FORCE allows an explicit category click to move focus from its button."
      (list
       (etaf-node 'row '(:item-gap (ch 1))
                  (list (ths--button 'page-quotes "行情 0" #'ths-show-quotes)
+                       (ths--button 'page-watchlist "自选股 4" #'ths-show-watchlist)
                        (ths--button 'page-ranking "排行榜 3" #'ths-show-ranking t)))
       (ths--shortcut-hint columns t)
       (etaf-node 'row '(:item-gap (ch 1) :height (lh 1) :overflow hidden)
@@ -604,7 +718,11 @@ FORCE allows an explicit category click to move focus from its button."
                                (equal (ths-data-id stock) (plist-get next :selected))) stocks)
              (setq next (plist-put next :selected (ths-data-id (car stocks)))))
            next)))
-  (when (eq ref ths--state) (ths--ensure-chart)))
+  (when (eq ref ths--state)
+    (ths--ensure-chart)
+    (when (and (eq (plist-get (etaf-value ref) :page) 'watchlist)
+               (memq key '(:selected :query :favorites :sorted)))
+      (ths--watchlist-focus))))
 
 (defun ths--color (change)
   "Return the A-share quote color for CHANGE."
@@ -670,12 +788,13 @@ Named panels occupy the current height budget, including padding."
                             (and (equal code (ths-data-id new-stock)) new-stock)) :symbol)) codes)))
 
 (defun ths-add-favorite (input &optional name)
-  "Add stock INPUT to the watchlist and open its quote details.
+  "Add stock INPUT, retaining the watchlist page or opening quote details.
 NAME is optional display metadata selected from stock search suggestions."
   (interactive (let ((stock (ths-search-read ths-data-stocks)))
                  (list (plist-get stock :symbol) (plist-get stock :name))))
   (let* ((symbol (ths-watchlist-symbol input)) (code (ths-data-symbol-id symbol))
          (stock (ths-data-find code)) (state (etaf-value ths--state))
+         (watchlist (eq (plist-get state :page) 'watchlist))
          (favorites (plist-get state :favorites))
          (next (if (member code favorites) favorites (append favorites (list code)))))
     (when (and stock (not (equal symbol (plist-get stock :symbol))))
@@ -688,10 +807,11 @@ NAME is optional display metadata selected from stock search suggestions."
     (etaf-update-value
      ths--state (lambda (old)
                   (let ((value (copy-sequence old)))
-                    (dolist (pair `((:favorites . ,next) (:page . quotes) (:tab . favorites)
-                                    (:query . "") (:selected . ,code) (:section . detail)))
+                    (dolist (pair `((:favorites . ,next) (:page . ,(if watchlist 'watchlist 'quotes)) (:tab . favorites)
+                                    (:query . "") (:selected . ,code) (:section . ,(if watchlist 'list 'detail))))
                       (setq value (plist-put value (car pair) (cdr pair))))
                     value)))
+    (when watchlist (ths--watchlist-focus))
     (when ths-auto-fetch
       (ths--fetch symbol 'quote)
       (ths--ensure-chart))))
@@ -712,6 +832,66 @@ NAME is optional display metadata selected from stock search suggestions."
   (ths--set ref :query
             (string-trim (read-string "代码 / 名称 / 行业（留空显示全部）: "
                                       (plist-get (etaf-value ref) :query)))))
+
+(defun ths--watchlist-view (state ref columns rows)
+  "Build a full-width watchlist table for STATE and REF in COLUMNS by ROWS."
+  (let* ((ths--roomy nil) (ths--panel-rows (- rows 5))
+         (stocks (ths--stocks state))
+         (capacity (max 1 (- rows 7)))
+         (index (or (cl-position (plist-get state :selected) stocks
+                                 :key #'ths-data-id :test #'equal) 0))
+         (page (/ index capacity))
+         (visible (seq-subseq stocks (* page capacity)
+                             (min (length stocks) (* (1+ page) capacity))))
+         (fields (ths--watchlist-columns columns)))
+    (setq ths--stock-page-size capacity)
+    (etaf-node
+     'column (list :ref 'watchlist-frame :height (list 'lh (1- rows)) :overflow 'hidden
+                   :bgcolor (ths-theme-color 'background) :color (ths-theme-color 'foreground)
+                   :padding '((lh 0) (ch 1)))
+     (list
+      (etaf-node 'row '(:height (lh 1) :item-gap (ch 1))
+                 (list (ths--button 'page-quotes "行情 0" #'ths-show-quotes)
+                       (ths--button 'page-watchlist "自选股 4" #'ths-show-watchlist t)
+                       (ths--button 'page-ranking "排行榜 3" #'ths-show-ranking)))
+      (ths--shortcut-hint columns nil state)
+      (ths--text (concat (ths--feed-status)
+                        (when (< (length fields) (length ths-watchlist-columns))
+                          (format " · %d 列未显示，按 C 配置或加宽窗口"
+                                  (- (length ths-watchlist-columns) (length fields)))))
+                 (ths-theme-color 'secondary))
+      (ths--panel
+       (format "自选股 / %d 支%s" (length stocks) (if (plist-get state :sorted) " · 按涨幅排序" ""))
+       (append
+        (list (etaf-node 'row '(:height (lh 1)) (ths--ranking-cells fields)))
+        (cl-loop for stock in visible for i from 0
+                 for code = (ths-data-id stock)
+                 collect
+                 (let ((selected-stock stock) (selected-code code))
+                   (etaf-node
+                    'row
+                    ;; Reuse visible row slots when paging; refs still identify
+                    ;; securities for focus and activation.
+                    (list :ref (intern (concat "watch-" code))
+                          :class (if (cl-evenp i) "ranking-row" "ranking-row ranking-row-alt")
+                          :role 'button :tab-index 0 :height '(lh 1)
+                          :bgcolor (when (equal code (plist-get state :selected))
+                                     (ths-theme-color 'selected))
+                          :on-focus-enter
+                          (lambda () (ths--watchlist-select-focused ref selected-code))
+                          :on-press (lambda () (ths--watchlist-open ref selected-stock))
+                          :help-echo (format "回车查看 %s 的分时图" (plist-get stock :name)))
+                    (ths--ranking-cells fields
+                                        (plist-put (copy-sequence stock) :change (ths-data-change stock))))))
+        (unless stocks
+          (list (ths--text (if (plist-get state :favorites)
+                              "没有匹配股票；按 / 清空搜索。"
+                            "暂无自选；按 a 添加股票或基金。") (ths-theme-color 'warning)))))
+       nil 'watchlist-table)
+      (etaf-node 'row '(:height (lh 1) :item-gap (ch 2))
+                 (list (ths--button 'stock-prev "上一页 p" (lambda () (ths-stock-page t)))
+                       (ths--text (format "%d / %d" (1+ page) (max 1 (ceiling (length stocks) capacity))))
+                       (ths--button 'stock-next "下一页 n" #'ths-stock-page)))))))
 
 (defun ths--watchlist (state ref)
   "Build stock list from STATE, with callbacks updating REF."
@@ -1026,32 +1206,39 @@ NAME is optional display metadata selected from stock search suggestions."
                                :test #'equal :key (lambda (stock) (plist-get stock :symbol)))))
       (when index (ths--ranking-focus-row rows index))))
   (if (equal key "RET")
-      (let* ((runtime (etaf-runtime-for-buffer (current-buffer)))
+      (if (eq (plist-get (etaf-value ths--state) :page) 'watchlist)
+          (when-let* ((stock (ths-data-find (plist-get (etaf-value ths--state) :selected))))
+            (ths--watchlist-open ths--state stock))
+        (let* ((runtime (etaf-runtime-for-buffer (current-buffer)))
              (focused (etaf-focused-host-ref runtime)))
         (when (and focused (string-prefix-p "rank-" (symbol-name focused)))
-          (etaf-activate runtime)))
+          (etaf-activate runtime))))
     (call-interactively (lookup-key ths-mode-map (kbd key)))))
 
 (defun ths--shortcut-hint (columns &optional ranking state)
   "Build clickable shortcut buttons suited to COLUMNS, RANKING and STATE."
   (let* ((stock (ths-data-find (plist-get state :selected)))
+         (watchlist (eq (plist-get state :page) 'watchlist))
          (items (append '(("j" "下一只") ("k" "上一只"))
+                        (when watchlist '(("RET" "打开") ("C" "表头")))
                         (if ranking '(("RET" "打开") ("u" "类别") ("s" "切换排行"))
                           '(("a" "添加") ("d" "删除") ("f" "自选") ("s" "排序")))
                         '(("p" "上一页") ("n" "下一页"))
-                        (if ranking '(("0" "行情"))
+                        (if watchlist '(("/" "搜索"))
+                          (if ranking '(("0" "行情"))
                           (if (ths-data-otc-p stock)
                               (if (plist-get stock :money-fund)
                                   '(("1" "收益") ("2" "年化") ("/" "搜索"))
                                 '(("1" "单位") ("2" "累计") ("/" "搜索")))
-                            '(("1" "分时") ("2" "日K") ("/" "搜索"))))
+                            '(("1" "分时") ("2" "日K") ("/" "搜索")))))
                         '(("r" "刷新") ("T" "主题") ("q" "退出"))))
          (full-width (+ (1- (length items))
                         (cl-loop for (key label) in items sum (+ 3 (string-width key) (string-width label)))))
          (compact (> full-width (- columns 2))))
     (when (< columns 80)
-      (setq items (seq-filter (lambda (item) (member (car item) (if ranking '("j" "k" "RET" "u" "s" "r" "T")
-                                                               '("j" "k" "a" "d" "/" "r" "T")))) items)))
+      (setq items (seq-filter (lambda (item) (member (car item) (cond (ranking '("j" "k" "RET" "u" "s" "r" "T"))
+                                                                  (watchlist '("j" "k" "RET" "C" "a" "r"))
+                                                                  (t '("j" "k" "a" "d" "/" "r" "T"))))) items)))
     (etaf-node
      'row (list :ref 'shortcut-hint :height '(lh 1) :overflow 'hidden :item-gap '(ch 1))
      (mapcar (lambda (item)
@@ -1076,6 +1263,8 @@ NAME is optional display metadata selected from stock search suggestions."
                  (list (ths--text "窗口太小，请放大窗口或缩小字体。"))))
      ((eq (plist-get state :page) 'ranking)
       (ths--ranking-view state ref columns))
+     ((eq (plist-get state :page) 'watchlist)
+      (ths--watchlist-view state ref columns rows))
      (t
       (etaf-node
        'column (list :ref 'dashboard-frame :height (list 'lh height) :overflow 'hidden
@@ -1087,6 +1276,7 @@ NAME is optional display metadata selected from stock search suggestions."
          (list
           (etaf-node 'row '(:height (lh 1) :overflow hidden :item-gap (ch 1))
                      (list (ths--button 'page-quotes "行情 0" #'ths-show-quotes t)
+                           (ths--button 'page-watchlist "自选股 4" #'ths-show-watchlist)
                            (ths--button 'page-ranking "排行榜 3" #'ths-show-ranking)
                            (ths--button 'clear-search "清空" (lambda () (ths--set ref :query "")))))
           (ths--shortcut-hint columns nil state)
@@ -1185,6 +1375,7 @@ NAME is optional display metadata selected from stock search suggestions."
                    ("a" . ths-add-favorite) ("d" . ths-remove-favorite)
                    ("1" . ths-intraday) ("2" . ths-daily) ("g" . ths-refit)
                    ("0" . ths-show-quotes) ("3" . ths-show-ranking)
+                   ("4" . ths-show-watchlist) ("C" . ths-configure-watchlist-columns)
                    ("u" . ths-ranking-cycle-universe)
                    ("n" . ths-next-page) ("p" . ths-previous-page)
                    ("r" . ths-refresh) ("T" . ths-toggle-theme) ("q" . quit-window)))
@@ -1225,6 +1416,9 @@ NAME is optional display metadata selected from stock search suggestions."
     (when (called-interactively-p 'interactive)
       (pop-to-buffer-same-window buffer)
       (ths-refit))
+    (with-current-buffer buffer
+      (when (and (fboundp 'meow-motion-mode) (not (bound-and-true-p meow-motion-mode)))
+        (meow-motion-mode 1)))
     buffer))
 
 (provide 'ths)

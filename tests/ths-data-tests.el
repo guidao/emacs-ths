@@ -14,6 +14,29 @@
 (defconst ths-test-eastmoney-minute
   "{\"data\":{\"preClose\":168.0,\"trends\":[\"2026-10-16 09:30,170,170,171,169,100,1700000,170\",\"2026-10-16 10:30,173,173.88,174,172,200,3400000,172\"]}}")
 
+(ert-deftest ths-quotes-normalize-volume-and-float-cap-across-providers ()
+  (let* ((fields (vconcat (ths-data--fields ths-test-tencent "v_sz300033" "~")
+                          (make-list 6 "")))
+         (data (ths-data--get (ths-data--json ths-test-eastmoney) "data")))
+    (aset fields 44 "567.89")
+    (setf (alist-get 'f47 data) 123456
+          (alist-get 'f117 data) 56789000000)
+    (dolist (quote (list (ths-data--quote-tencent
+                         (format "v_sz300033=\"%s\";" (mapconcat #'identity fields "~")) "sz300033")
+                        (ths-data--quote-eastmoney (json-serialize `((data . ,data))) "sz300033")))
+      (should (= (plist-get quote :volume) 123456))
+      (should (< (abs (- (plist-get quote :float-cap) 56789000000)) 0.01)))
+    (let ((quote (ths-data--quote-sina ths-test-sina "sz300033")))
+      (should (= (plist-get quote :volume) 123456))
+      (should-not (plist-get quote :float-cap)))
+    (dolist (value '("-" -1 0))
+      (setf (alist-get 'f47 data) value (alist-get 'f117 data) value)
+      (let ((quote (ths-data--quote-eastmoney (json-serialize `((data . ,data))) "sz300033")))
+        (should (equal (plist-get quote :volume) (when (equal value 0) 0)))
+        (should-not (plist-get quote :float-cap))))
+    (dolist (field '("f47" "f117"))
+      (should (string-match-p field (ths-data--url 'eastmoney 'quote "sz300033"))))))
+
 (ert-deftest ths-fund-quotes-keep-milliprices-across-providers ()
   ;; Synthetic protocol fixtures: adjacent prices must not collapse to cents.
   (dolist (symbol '("sh510300" "sz159915" "sh501018" "sz161725"))

@@ -213,6 +213,8 @@ STEP is the field-index increment between levels (default 2)."
     (list :name (nth 1 fields) :price (ths-data--positive (nth 3 fields))
           :close (ths-data--positive (nth 4 fields)) :open (ths-data--positive (nth 5 fields))
           :high (ths-data--positive (nth 33 fields)) :low (ths-data--positive (nth 34 fields))
+          :volume (ths-data--volume (nth 6 fields))
+          :float-cap (when-let* ((n (ths-data--positive (nth 44 fields)))) (* n 100000000.0))
           :amount (when-let* ((n (ths-data-number (nth 37 fields)))) (* n 10000.0))
           :turnover (ths-data-number (nth 38 fields))
           :time (ths-data--timestamp (nth 30 fields))
@@ -226,6 +228,8 @@ STEP is the field-index increment between levels (default 2)."
     (list :name (nth 0 fields) :price (ths-data--positive (nth 3 fields))
           :close (ths-data--positive (nth 2 fields)) :open (ths-data--positive (nth 1 fields))
           :high (ths-data--positive (nth 4 fields)) :low (ths-data--positive (nth 5 fields))
+          :volume (when-let* ((n (ths-data--volume (nth 8 fields)))) (/ n 100.0))
+          :float-cap nil
           :amount (ths-data-number (nth 9 fields)) :turnover nil
           :time (concat (nth 30 fields) " " (nth 31 fields))
           :book (ths-data--book-rows get 20 10 t 100))))
@@ -238,6 +242,8 @@ STEP is the field-index increment between levels (default 2)."
     (list :name (funcall get 58) :price (ths-data--positive (funcall get 43))
           :close (ths-data--positive (funcall get 60)) :open (ths-data--positive (funcall get 46))
           :high (ths-data--positive (funcall get 44)) :low (ths-data--positive (funcall get 45))
+          :volume (ths-data--volume (funcall get 47))
+          :float-cap (ths-data--positive (funcall get 117))
           :amount (ths-data-number (funcall get 48)) :turnover (ths-data-number (funcall get 168))
           :time (when-let* ((stamp (ths-data--positive (funcall get 86))))
                   (format-time-string "%F %T" (seconds-to-time stamp) 28800))
@@ -338,7 +344,7 @@ counter decreases have unknown minute volume, rather than a made-up zero."
       (`(tencent daily) (concat "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=" symbol ",day,,,120,"))
       (`(eastmoney quote)
        (concat "https://push2.eastmoney.com/api/qt/stock/get?secid=" secid
-               "&fltt=2&invt=2&fields=f43,f44,f45,f46,f48,f57,f58,f60,f86,f168,f530,"
+               "&fltt=2&invt=2&fields=f43,f44,f45,f46,f47,f48,f57,f58,f60,f86,f117,f168,f530,"
                (mapconcat (lambda (n) (format "f%d" n)) (append (number-sequence 11 20) (number-sequence 31 40)) ",")))
       (`(eastmoney intraday)
        (concat "https://push2his.eastmoney.com/api/qt/stock/trends2/get?secid=" secid
